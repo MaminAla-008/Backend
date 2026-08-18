@@ -1,31 +1,48 @@
-const sqlite3 = require("sqlite3").verbose();
+const { Pool } = require("pg");
 
-const db = new sqlite3.Database("./users.db", (err) => {
-    if (err) {
-        console.error("Erreur de connexion : ", err.message);
-    } else {
-        console.log("Connécté à la base de données Sqlite.");
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === "production"
+        ? { rejectUnauthorized: false }
+        : false
+});
 
-        db.run(`
+pool.on("connect", () => {
+    console.log("Connecté à PostgreSQL.");
+});
+
+pool.on("error", (err) => {
+    console.error("Erreur PostgreSQL :", err.message);
+});
+
+const initDatabase = async () => {
+    try {
+        await pool.query(`
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 username TEXT NOT NULL,
                 email TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL
             )
         `);
 
-        db.run(`
+        await pool.query(`
             CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 client TEXT NOT NULL,
                 reference TEXT NOT NULL UNIQUE,
                 total REAL NOT NULL,
                 items TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `);
-    }
-});
 
-module.exports = db;
+        console.log("Tables PostgreSQL prêtes.");
+    } catch (err) {
+        console.error("Erreur de création des tables :", err.message);
+    }
+};
+
+initDatabase();
+
+module.exports = pool;
