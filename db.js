@@ -2,17 +2,18 @@ const { Pool } = require("pg");
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === "production"
-        ? { rejectUnauthorized: false }
-        : false
+    ssl:
+        process.env.NODE_ENV === "production"
+            ? { rejectUnauthorized: false }
+            : false,
 });
 
 pool.on("connect", () => {
-    console.log("Connecté à PostgreSQL.");
+    console.log("✅ Connecté à PostgreSQL.");
 });
 
 pool.on("error", (err) => {
-    console.error("Erreur PostgreSQL :", err.message);
+    console.error("❌ Erreur PostgreSQL :", err);
 });
 
 const initDatabase = async () => {
@@ -37,9 +38,9 @@ const initDatabase = async () => {
             )
         `);
 
-        console.log("Tables PostgreSQL prêtes.");
+        console.log("✅ Tables PostgreSQL prêtes.");
     } catch (err) {
-        console.error("Erreur de création des tables :", err.message);
+        console.error("❌ Erreur de création des tables :", err);
     }
 };
 
