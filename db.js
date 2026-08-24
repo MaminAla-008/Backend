@@ -2,10 +2,10 @@ const { Pool } = require("pg");
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl:
-        process.env.NODE_ENV === "production"
-            ? { rejectUnauthorized: false }
-            : false,
+
+    ssl: {
+        rejectUnauthorized: false
+    }
 });
 
 pool.on("connect", () => {
@@ -13,11 +13,12 @@ pool.on("connect", () => {
 });
 
 pool.on("error", (err) => {
-    console.error("❌ Erreur PostgreSQL :", err);
+    console.error("❌ Erreur PostgreSQL :", err.message);
 });
 
 const initDatabase = async () => {
     try {
+
         await pool.query(`
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -39,11 +40,22 @@ const initDatabase = async () => {
         `);
 
         console.log("✅ Tables PostgreSQL prêtes.");
+
     } catch (err) {
-        console.error("❌ Erreur de création des tables :", err);
+
+        console.error(
+            "❌ Erreur de création des tables :",
+            err.message
+        );
     }
 };
 
-initDatabase();
+if (process.env.DATABASE_URL) {
+    initDatabase();
+} else {
+    console.log(
+        "⚠️ DATABASE_URL absente : PostgreSQL désactivé en local."
+    );
+}
 
 module.exports = pool;

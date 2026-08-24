@@ -1,12 +1,21 @@
 const express = require("express");
 const router = express.Router();
+
 const db = require("../db");
 
-// =========================
+// =====================================================
 // REGISTER
-// =========================
+// =====================================================
+
 router.post("/register", async (req, res) => {
-    const { username, email, password } = req.body;
+
+    console.log("📥 REGISTER :", req.body);
+
+    const {
+        username,
+        email,
+        password
+    } = req.body;
 
     if (!username || !email || !password) {
         return res.status(400).json({
@@ -15,33 +24,85 @@ router.post("/register", async (req, res) => {
     }
 
     try {
-        const result = await db.query(
-            `INSERT INTO users (username, email, password)
-             VALUES ($1, $2, $3)
-             RETURNING id`,
-            [username, email, password]
+
+        const existingUser = await db.query(
+            `
+            SELECT id
+            FROM users
+            WHERE email = $1
+            `,
+            [email]
         );
 
-        res.json({
+        if (existingUser.rows.length > 0) {
+            return res.status(400).json({
+                message: "Cette adresse existe déjà"
+            });
+        }
+
+        const result = await db.query(
+            `
+            INSERT INTO users
+            (
+                username,
+                email,
+                password
+            )
+            VALUES
+            (
+                $1,
+                $2,
+                $3
+            )
+            RETURNING id, username, email
+            `,
+            [
+                username,
+                email,
+                password
+            ]
+        );
+
+        console.log("✅ Compte créé :", result.rows[0]);
+
+        res.status(201).json({
             message: "Compte créé avec succès",
-            id: result.rows[0].id
+            user: result.rows[0]
         });
 
     } catch (err) {
-        res.status(400).json({
-            message: "Erreur : " + err.message
+
+        console.error(
+            "❌ Erreur inscription :",
+            err
+        );
+
+        res.status(500).json({
+            message: "Erreur serveur lors de la création du compte"
         });
     }
 });
 
 
-// =========================
+// =====================================================
 // LOGIN
-// =========================
-router.post("/login", async (req, res) => {
-    const { email, password, username, identifier } = req.body;
+// =====================================================
 
-    const loginIdentifier = identifier || email || username;
+router.post("/login", async (req, res) => {
+
+    console.log("📥 LOGIN :", req.body);
+
+    const {
+        identifier,
+        username,
+        email,
+        password
+    } = req.body;
+
+    const loginIdentifier =
+        identifier ||
+        username ||
+        email;
 
     if (!loginIdentifier || !password) {
         return res.status(400).json({
@@ -50,12 +111,25 @@ router.post("/login", async (req, res) => {
     }
 
     try {
+
         const result = await db.query(
-            `SELECT *
-             FROM users
-             WHERE (email = $1 OR username = $2)
-             AND password = $3`,
-            [loginIdentifier, loginIdentifier, password]
+            `
+            SELECT
+                id,
+                username,
+                email
+            FROM users
+            WHERE
+                (
+                    username = $1
+                    OR email = $1
+                )
+                AND password = $2
+            `,
+            [
+                loginIdentifier,
+                password
+            ]
         );
 
         const user = result.rows[0];
@@ -66,26 +140,42 @@ router.post("/login", async (req, res) => {
             });
         }
 
+        console.log("✅ Connexion réussie :", user);
+
         res.json({
             message: "Connexion réussie",
             user
         });
 
     } catch (err) {
+
+        console.error(
+            "❌ Erreur connexion :",
+            err
+        );
+
         res.status(500).json({
-            message: err.message
+            message: "Erreur serveur"
         });
     }
 });
 
 
-// =========================
+// =====================================================
 // ADMIN LOGIN
-// =========================
-router.post("/admin/login", (req, res) => {
-    const { username, password } = req.body;
+// =====================================================
 
-    if (username === "admin" && password === "admin123") {
+router.post("/admin/login", (req, res) => {
+
+    const {
+        username,
+        password
+    } = req.body;
+
+    if (
+        username === "admin" &&
+        password === "admin123"
+    ) {
         return res.json({
             message: "Connexion administrateur réussie",
             admin: true
@@ -98,86 +188,157 @@ router.post("/admin/login", (req, res) => {
 });
 
 
-// =========================
+// =====================================================
 // GET USERS
-// =========================
+// =====================================================
+
 router.get("/users", async (req, res) => {
+
     try {
+
         const result = await db.query(
-            "SELECT id, username, email FROM users ORDER BY id DESC"
+            `
+            SELECT
+                id,
+                username,
+                email
+            FROM users
+            ORDER BY id DESC
+            `
         );
 
         res.json(result.rows);
 
     } catch (err) {
+
+        console.error(
+            "❌ Erreur utilisateurs :",
+            err
+        );
+
         res.status(500).json({
-            message: err.message
+            message: "Erreur serveur"
         });
     }
 });
 
 
-// =========================
+// =====================================================
 // CREATE ORDER
-// =========================
-router.post("/orders", async (req, res) => {
-    const { client, reference, total, items } = req.body;
+// =====================================================
 
-    if (!client || !reference || !items) {
+router.post("/orders", async (req, res) => {
+
+    const {
+        client,
+        reference,
+        total,
+        items
+    } = req.body;
+
+    if (!client || !reference || items === undefined) {
         return res.status(400).json({
             message: "Données de commande incomplètes"
         });
     }
 
     try {
+
         const result = await db.query(
-            `INSERT INTO orders
-             (client, reference, total, items)
-             VALUES ($1, $2, $3, $4)
-             RETURNING id`,
-            [
+            `
+            INSERT INTO orders
+            (
                 client,
                 reference,
                 total,
+                items
+            )
+            VALUES
+            (
+                $1,
+                $2,
+                $3,
+                $4
+            )
+            RETURNING id
+            `,
+            [
+                client,
+                reference,
+                total || 0,
                 JSON.stringify(items)
             ]
         );
 
-        res.json({
+        res.status(201).json({
             message: "Commande enregistrée",
             id: result.rows[0].id,
             reference
         });
 
     } catch (err) {
+
+        console.error(
+            "❌ Erreur commande :",
+            err
+        );
+
         res.status(500).json({
-            message: err.message
+            message: "Erreur serveur"
         });
     }
 });
 
 
-// =========================
+// =====================================================
 // GET ORDERS
-// =========================
+// =====================================================
+
 router.get("/orders", async (req, res) => {
+
     try {
+
         const result = await db.query(
-            `SELECT id, client, reference, total, items, created_at
-             FROM orders
-             ORDER BY id DESC`
+            `
+            SELECT
+                id,
+                client,
+                reference,
+                total,
+                items,
+                created_at
+            FROM orders
+            ORDER BY id DESC
+            `
         );
 
-        const orders = result.rows.map((row) => ({
-            ...row,
-            items: JSON.parse(row.items)
-        }));
+        const orders = result.rows.map((row) => {
+
+            let items = [];
+
+            try {
+                items = JSON.parse(row.items);
+            } catch {
+                items = [];
+            }
+
+            return {
+                ...row,
+                items
+            };
+        });
 
         res.json(orders);
 
     } catch (err) {
+
+        console.error(
+            "❌ Erreur commandes :",
+            err
+        );
+
         res.status(500).json({
-            message: err.message
+            message: "Erreur serveur"
         });
     }
 });
