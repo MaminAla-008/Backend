@@ -1,5 +1,6 @@
 const express = require("express");
 const jwt = require("jsonwebtoken");
+const bcrypt = require("bcrypt");
 const router = express.Router();
 
 const db = require("../db");
@@ -50,36 +51,47 @@ const requireAdmin = (req, res, next) => {
 // =====================================================
 
 router.post("/register", async (req, res) => {
-
     const {
         username,
-        email,
+        phone,
         password
-    } = req.body;
+    } = req.body || {};
+    const rawPhone = phone || username;
+    const phoneInput = typeof rawPhone === "string" ? rawPhone.trim() : "";
+    const normalizedPhone = phoneInput.replace(/\D/g, "");
+    const accountPassword = typeof password === "string" ? password : "";
 
-    if (!username || !email || !password) {
+    if (!phoneInput || !accountPassword.trim()) {
         return res.status(400).json({
-            message: "Tous les champs sont requis"
+            message: "Le numéro de téléphone et le mot de passe sont obligatoires."
         });
     }
 
-    try {
+    if (!/^\+?[\d\s().-]+$/.test(phoneInput) || normalizedPhone.length < 7 || normalizedPhone.length > 15) {
+        return res.status(400).json({
+            message: "Veuillez saisir un numéro de téléphone valide."
+        });
+    }
 
+    const accountEmail = `phone-${normalizedPhone}@accounts.shopix.invalid`;
+
+    try {
         const existingUser = await db.query(
             `
             SELECT id
             FROM users
-            WHERE email = $1
+            WHERE username = $1 OR username = $2 OR email = $3
             `,
-            [email]
+            [normalizedPhone, phoneInput, accountEmail]
         );
 
         if (existingUser.rows.length > 0) {
             return res.status(400).json({
-                message: "Cette adresse existe déjà"
+                message: "Un compte existe déjà avec ce numéro de téléphone."
             });
         }
 
+        const hashedPassword = await bcrypt.hash(accountPassword, 12);
         const result = await db.query(
             `
             INSERT INTO users
@@ -97,28 +109,23 @@ router.post("/register", async (req, res) => {
             RETURNING id, username, email
             `,
             [
-                username,
-                email,
-                password
+                normalizedPhone,
+                accountEmail,
+                hashedPassword
             ]
         );
 
-        console.log("✅ Compte créé :", result.rows[0]);
-
-        res.status(201).json({
+        return res.status(201).json({
             message: "Compte créé avec succès",
-            user: result.rows[0]
+            user: {
+                id: result.rows[0].id,
+                username: result.rows[0].username
+            }
         });
-
     } catch (err) {
-
-        console.error(
-            "❌ Erreur inscription :",
-            err
-        );
-
-        res.status(500).json({
-            message: "Erreur serveur lors de la création du compte"
+        console.error("❌ Erreur inscription :", err);
+        return res.status(500).json({
+            message: "Erreur serveur lors de la création du compte."
         });
     }
 });
@@ -135,14 +142,19 @@ router.post("/login", async (req, res) => {
         username,
         email,
         password
-    } = req.body;
+    } = req.body || {};
 
     const loginIdentifier =
         identifier ||
         username ||
         email;
 
-    if (!loginIdentifier || !password) {
+    if (
+        typeof loginIdentifier !== "string" ||
+        !loginIdentifier.trim() ||
+        typeof password !== "string" ||
+        !password
+    ) {
         return res.status(400).json({
             message: "Identifiant et mot de passe requis"
         });
@@ -155,34 +167,54 @@ router.post("/login", async (req, res) => {
             SELECT
                 id,
                 username,
-                email
+                password
             FROM users
             WHERE
                 (
                     username = $1
+                    OR username = $2
                     OR email = $1
                 )
-                AND password = $2
             `,
             [
                 loginIdentifier,
-                password
+                loginIdentifier.replace(/\D/g, "")
             ]
         );
 
-        const user = result.rows[0];
+        const userRecord = result.rows[0];
 
-        if (!user) {
+        if (!userRecord) {
             return res.status(401).json({
                 message: "Identifiant ou mot de passe incorrect"
             });
         }
 
-        console.log("✅ Connexion réussie :", user);
+        const isHashedPassword = /^\$2[aby]\$/.test(userRecord.password);
+        const passwordMatches = isHashedPassword
+            ? await bcrypt.compare(password, userRecord.password)
+            : password === userRecord.password;
 
-        res.json({
+        if (!passwordMatches) {
+            return res.status(401).json({
+                message: "Identifiant ou mot de passe incorrect"
+            });
+        }
+
+        if (!isHashedPassword) {
+            const upgradedPassword = await bcrypt.hash(password, 12);
+            await db.query(
+                "UPDATE users SET password = $1 WHERE id = $2",
+                [upgradedPassword, userRecord.id]
+            );
+        }
+
+        return res.json({
             message: "Connexion réussie",
-            user
+            user: {
+                id: userRecord.id,
+                username: userRecord.username
+            }
         });
 
     } catch (err) {
@@ -251,8 +283,7 @@ router.get("/users", requireAdmin, async (req, res) => {
             `
             SELECT
                 id,
-                username,
-                email
+                username
             FROM users
             ORDER BY id DESC
             `

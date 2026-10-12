@@ -19,3 +19,5 @@ Après connexion, la session admin expire au bout de 8 heures. Les listes de com
 npm install
 npm run dev
 ```
+
+La création d’un compte client nécessite uniquement `phone` et `password`. Les nouveaux mots de passe sont hachés avec bcrypt ; les mots de passe historiques sont migrés vers bcrypt lors de leur prochaine connexion.
