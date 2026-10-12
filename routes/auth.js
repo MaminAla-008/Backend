@@ -1,15 +1,55 @@
 const express = require("express");
+const jwt = require("jsonwebtoken");
 const router = express.Router();
 
 const db = require("../db");
+const isProduction =
+    process.env.NODE_ENV === "production" ||
+    process.env.RENDER === "true";
+const jwtSecret =
+    process.env.JWT_SECRET ||
+    (isProduction ? "" : "shopix-local-admin-secret");
+
+const requireAdmin = (req, res, next) => {
+    if (!jwtSecret) {
+        return res.status(503).json({
+            message: "Le serveur doit être configuré avec JWT_SECRET."
+        });
+    }
+
+    const authorization = req.get("authorization") || "";
+    const [scheme, token] = authorization.split(" ");
+
+    if (scheme !== "Bearer" || !token) {
+        return res.status(401).json({
+            message: "Authentification administrateur requise."
+        });
+    }
+
+    try {
+        const payload = jwt.verify(token, jwtSecret, {
+            algorithms: ["HS256"]
+        });
+
+        if (typeof payload !== "object" || payload.role !== "admin") {
+            return res.status(403).json({
+                message: "Accès réservé à l’administrateur."
+            });
+        }
+
+        return next();
+    } catch (err) {
+        return res.status(401).json({
+            message: "Session administrateur invalide ou expirée."
+        });
+    }
+};
 
 // =====================================================
 // REGISTER
 // =====================================================
 
 router.post("/register", async (req, res) => {
-
-    console.log("📥 REGISTER :", req.body);
 
     const {
         username,
@@ -90,8 +130,6 @@ router.post("/register", async (req, res) => {
 
 router.post("/login", async (req, res) => {
 
-    console.log("📥 LOGIN :", req.body);
-
     const {
         identifier,
         username,
@@ -171,14 +209,27 @@ router.post("/admin/login", (req, res) => {
         username,
         password
     } = req.body;
+    const adminUsername =
+        process.env.ADMIN_USERNAME ||
+        (isProduction ? "" : "admin");
+    const adminPassword =
+        process.env.ADMIN_PASSWORD ||
+        (isProduction ? "" : "admin123");
 
-    if (
-        username === "admin" &&
-        password === "admin123"
-    ) {
+    if (!jwtSecret || !adminUsername || !adminPassword) {
+        return res.status(503).json({
+            message: "L’authentification administrateur n’est pas configurée sur le serveur."
+        });
+    }
+
+    if (username === adminUsername && password === adminPassword) {
         return res.json({
             message: "Connexion administrateur réussie",
-            admin: true
+            admin: true,
+            token: jwt.sign({ role: "admin" }, jwtSecret, {
+                algorithm: "HS256",
+                expiresIn: "8h"
+            })
         });
     }
 
@@ -192,7 +243,7 @@ router.post("/admin/login", (req, res) => {
 // GET USERS
 // =====================================================
 
-router.get("/users", async (req, res) => {
+router.get("/users", requireAdmin, async (req, res) => {
 
     try {
 
@@ -218,6 +269,42 @@ router.get("/users", async (req, res) => {
 
         res.status(500).json({
             message: "Erreur serveur"
+        });
+    }
+});
+
+// =====================================================
+// DELETE USER
+// =====================================================
+
+router.delete("/users/:id", requireAdmin, async (req, res) => {
+    const userId = Number(req.params.id);
+
+    if (!Number.isSafeInteger(userId) || userId < 1) {
+        return res.status(400).json({
+            message: "Identifiant de compte invalide."
+        });
+    }
+
+    try {
+        const result = await db.query(
+            "DELETE FROM users WHERE id = $1 RETURNING id",
+            [userId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({
+                message: "Ce compte n’existe plus."
+            });
+        }
+
+        return res.json({
+            message: "Compte supprimé. L’historique des commandes est conservé."
+        });
+    } catch (err) {
+        console.error("❌ Erreur suppression compte :", err);
+        return res.status(500).json({
+            message: "Erreur serveur lors de la suppression du compte."
         });
     }
 });
@@ -294,10 +381,8 @@ router.post("/orders", async (req, res) => {
 // GET ORDERS
 // =====================================================
 
-router.get("/orders", async (req, res) => {
-
+const listOrders = async (req, res) => {
     try {
-
         const result = await db.query(
             `
             SELECT
@@ -313,9 +398,7 @@ router.get("/orders", async (req, res) => {
         );
 
         const orders = result.rows.map((row) => {
-
             let items = [];
-
             try {
                 items = JSON.parse(row.items);
             } catch {
@@ -328,17 +411,50 @@ router.get("/orders", async (req, res) => {
             };
         });
 
-        res.json(orders);
-
+        return res.json(orders);
     } catch (err) {
+        console.error("❌ Erreur commandes :", err);
+        return res.status(500).json({
+            message: "Erreur serveur"
+        });
+    }
+};
 
-        console.error(
-            "❌ Erreur commandes :",
-            err
+router.get("/orders", listOrders);
+router.get("/admin/orders", requireAdmin, listOrders);
+
+// =====================================================
+// DELETE ORDER
+// =====================================================
+
+router.delete("/admin/orders/:id", requireAdmin, async (req, res) => {
+    const orderId = Number(req.params.id);
+
+    if (!Number.isSafeInteger(orderId) || orderId < 1) {
+        return res.status(400).json({
+            message: "Identifiant de commande invalide."
+        });
+    }
+
+    try {
+        const result = await db.query(
+            "DELETE FROM orders WHERE id = $1 RETURNING id",
+            [orderId]
         );
 
-        res.status(500).json({
-            message: "Erreur serveur"
+        if (result.rowCount === 0) {
+            return res.status(404).json({
+                message: "Cette commande n’existe plus."
+            });
+        }
+
+        return res.json({
+            message: "Commande supprimée."
+        });
+    } catch (err) {
+        console.error("❌ Erreur suppression commande :", err);
+        return res.status(500).json({
+            message: "Erreur serveur lors de la suppression de la commande."
         });
     }
 });
