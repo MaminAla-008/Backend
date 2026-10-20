@@ -508,12 +508,6 @@ router.patch("/admin/orders/:id/payment", requireAdmin, async (req, res) => {
         });
     }
 
-    if (req.body?.status !== "verified") {
-        return res.status(400).json({
-            message: "Seule la confirmation manuelle d’un paiement vérifié est autorisée."
-        });
-    }
-
     try {
         const existingOrder = await db.query(
             `
