@@ -13,6 +13,12 @@ Générez un secret avec `node -e "console.log(require('crypto').randomBytes(48)
 
 Après connexion, la session admin expire au bout de 8 heures. Les listes de comptes et de commandes ainsi que leurs routes de suppression exigent ce jeton. Supprimer un compte conserve ses commandes ; supprimer une commande efface définitivement son enregistrement et ses articles.
 
+## Paiement manuel MVola
+
+Le client effectue lui-même un transfert MVola au bénéficiaire et au numéro affichés au panier, puis saisit la référence exacte figurant sur son reçu. La commande conserve séparément sa référence Shopix et cette référence de transaction. Elle reste « en attente » jusqu’à ce qu’un administrateur compare le reçu au transfert reçu et confirme manuellement le paiement dans le tableau de bord. La référence saisie seule ne prouve pas le paiement.
+
+Les colonnes de paiement sont ajoutées automatiquement au démarrage ; les commandes existantes sont conservées. Une référence de transaction ne peut être associée qu’à une seule commande.
+
 ## Lancer le backend localement
 
 ```sh

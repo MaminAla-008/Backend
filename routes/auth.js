@@ -351,12 +351,29 @@ router.post("/orders", async (req, res) => {
         client,
         reference,
         total,
-        items
+        items,
+        paymentMethod,
+        transactionReference
     } = req.body;
 
     if (!client || !reference || items === undefined) {
         return res.status(400).json({
             message: "Données de commande incomplètes"
+        });
+    }
+
+    const normalizedTransactionReference =
+        typeof transactionReference === "string"
+            ? transactionReference.trim()
+            : "";
+
+    if (
+        paymentMethod === "MVola" &&
+        (normalizedTransactionReference.length < 4 ||
+            normalizedTransactionReference.length > 100)
+    ) {
+        return res.status(400).json({
+            message: "Saisissez la référence exacte du transfert MVola (4 à 100 caractères)."
         });
     }
 
@@ -369,32 +386,53 @@ router.post("/orders", async (req, res) => {
                 client,
                 reference,
                 total,
-                items
+                items,
+                payment_method,
+                transaction_reference,
+                payment_status
             )
             VALUES
             (
                 $1,
                 $2,
                 $3,
-                $4
+                $4,
+                $5,
+                $6,
+                'pending'
             )
-            RETURNING id
+            RETURNING id, reference, payment_method, transaction_reference, payment_status
             `,
             [
                 client,
                 reference,
                 total || 0,
-                JSON.stringify(items)
+                JSON.stringify(items),
+                paymentMethod || "MVola",
+                normalizedTransactionReference || null
             ]
         );
 
-        res.status(201).json({
+        return res.status(201).json({
             message: "Commande enregistrée",
             id: result.rows[0].id,
-            reference
+            reference: result.rows[0].reference,
+            paymentMethod: result.rows[0].payment_method,
+            transactionReference: result.rows[0].transaction_reference,
+            paymentStatus: result.rows[0].payment_status
         });
 
     } catch (err) {
+
+        if (
+            err.code === "23505" ||
+            err.code === "SQLITE_CONSTRAINT" ||
+            /unique constraint failed/i.test(err.message || "")
+        ) {
+            return res.status(409).json({
+                message: "Cette référence de commande ou de transaction a déjà été utilisée."
+            });
+        }
 
         console.error(
             "❌ Erreur commande :",
@@ -422,6 +460,9 @@ const listOrders = async (req, res) => {
                 reference,
                 total,
                 items,
+                payment_method,
+                transaction_reference,
+                payment_status,
                 created_at
             FROM orders
             ORDER BY id DESC
@@ -453,6 +494,74 @@ const listOrders = async (req, res) => {
 
 router.get("/orders", listOrders);
 router.get("/admin/orders", requireAdmin, listOrders);
+
+// =====================================================
+// VERIFY MANUAL MVOLA PAYMENT
+// =====================================================
+
+router.patch("/admin/orders/:id/payment", requireAdmin, async (req, res) => {
+    const orderId = Number(req.params.id);
+
+    if (!Number.isSafeInteger(orderId) || orderId < 1) {
+        return res.status(400).json({
+            message: "Identifiant de commande invalide."
+        });
+    }
+
+    if (req.body?.status !== "verified") {
+        return res.status(400).json({
+            message: "Seule la confirmation manuelle d’un paiement vérifié est autorisée."
+        });
+    }
+
+    try {
+        const existingOrder = await db.query(
+            `
+            SELECT id, reference, transaction_reference
+            FROM orders
+            WHERE id = $1
+                AND transaction_reference IS NOT NULL
+                AND transaction_reference <> ''
+            `,
+            [orderId]
+        );
+
+        if (existingOrder.rowCount === 0) {
+            const order = await db.query(
+                "SELECT id FROM orders WHERE id = $1",
+                [orderId]
+            );
+            return res.status(order.rowCount ? 409 : 404).json({
+                message: order.rowCount
+                    ? "Impossible de vérifier le paiement sans référence MVola enregistrée."
+                    : "Cette commande n’existe plus."
+            });
+        }
+
+        await db.query(
+            "UPDATE orders SET payment_status = 'verified' WHERE id = $1",
+            [orderId]
+        );
+        const result = await db.query(
+            `
+            SELECT id, reference, transaction_reference, payment_status
+            FROM orders
+            WHERE id = $1
+            `,
+            [orderId]
+        );
+
+        return res.json({
+            message: "Paiement marqué comme vérifié.",
+            order: result.rows[0]
+        });
+    } catch (err) {
+        console.error("❌ Erreur vérification paiement :", err);
+        return res.status(500).json({
+            message: "Erreur serveur lors de la vérification du paiement."
+        });
+    }
+});
 
 // =====================================================
 // DELETE ORDER

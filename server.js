@@ -3,8 +3,8 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 
-// Connexion PostgreSQL
-require("./db");
+// Connexion à la base de données
+const db = require("./db");
 
 const app = express();
 
@@ -39,6 +39,11 @@ app.use("/api/auth", authRoutes);
 
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
-    console.log(`Server demarre sur le port ${PORT}`);
+db.ready.then(() => {
+    app.listen(PORT, () => {
+        console.log(`Server demarre sur le port ${PORT}`);
+    });
+}).catch((err) => {
+    console.error("❌ Impossible de démarrer le serveur :", err.message);
+    process.exit(1);
 });
