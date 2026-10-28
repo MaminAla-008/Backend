@@ -1,9 +1,11 @@
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcrypt");
+const { timingSafeEqual } = require("node:crypto");
 const router = express.Router();
 
 const db = require("../db");
+const { processDetectedPayment } = require("../services/mvolaPayments");
 const isProduction =
     process.env.NODE_ENV === "production" ||
     process.env.RENDER === "true";
@@ -44,6 +46,27 @@ const requireAdmin = (req, res, next) => {
             message: "Session administrateur invalide ou expirée."
         });
     }
+};
+
+const requireMvolaWebhook = (req, res, next) => {
+    const expectedSecret = process.env.MVOLA_WEBHOOK_SECRET || "";
+    const receivedSecret = req.get("x-mvola-webhook-secret") || "";
+    const expected = Buffer.from(expectedSecret);
+    const received = Buffer.from(receivedSecret);
+
+    if (expected.length < 32) {
+        return res.status(503).json({
+            message: "La liaison avec le détecteur MVola nécessite un secret d’au moins 32 caractères."
+        });
+    }
+
+    if (expected.length !== received.length || !timingSafeEqual(expected, received)) {
+        return res.status(401).json({
+            message: "Authentification du détecteur MVola invalide."
+        });
+    }
+
+    return next();
 };
 
 // =====================================================
@@ -366,14 +389,18 @@ router.post("/orders", async (req, res) => {
         typeof transactionReference === "string"
             ? transactionReference.trim()
             : "";
+    const normalizedPaymentMethod = paymentMethod || "MVola";
+    const orderTotal = Number(total);
 
     if (
-        paymentMethod === "MVola" &&
+        normalizedPaymentMethod === "MVola" &&
         (normalizedTransactionReference.length < 4 ||
-            normalizedTransactionReference.length > 100)
+            normalizedTransactionReference.length > 100 ||
+            !Number.isFinite(orderTotal) ||
+            orderTotal <= 0)
     ) {
         return res.status(400).json({
-            message: "Saisissez la référence exacte du transfert MVola (4 à 100 caractères)."
+            message: "Saisissez la référence exacte du transfert MVola et un montant de commande valide."
         });
     }
 
@@ -406,12 +433,60 @@ router.post("/orders", async (req, res) => {
             [
                 client,
                 reference,
-                total || 0,
+                orderTotal || 0,
                 JSON.stringify(items),
-                paymentMethod || "MVola",
+                normalizedPaymentMethod,
                 normalizedTransactionReference || null
             ]
         );
+
+        let paymentStatus = result.rows[0].payment_status;
+        if (normalizedTransactionReference) {
+            let detectedReceipt = await db.query(
+                `
+                SELECT transaction_reference, amount, sender_phone
+                FROM payment_alerts
+                WHERE transaction_reference = $1 AND resolved_at IS NULL
+                `,
+                [normalizedTransactionReference]
+            );
+            let referenceMatches = detectedReceipt.rowCount > 0;
+            if (!referenceMatches) {
+                const unmatchedReceipts = await db.query(
+                    `
+                    SELECT transaction_reference, amount, sender_phone, created_at
+                    FROM payment_alerts
+                    WHERE resolved_at IS NULL AND order_id IS NULL
+                    ORDER BY created_at DESC
+                    LIMIT 50
+                    `
+                );
+                const clientPhone = normalizePhone(client);
+                const recentMatches = unmatchedReceipts.rows.filter((receipt) => {
+                    return clientPhone && normalizePhone(receipt.sender_phone) === clientPhone &&
+                        withinOneDay(receipt.created_at, Date.now());
+                });
+                if (recentMatches.length === 1) {
+                    detectedReceipt = { rows: recentMatches, rowCount: 1 };
+                }
+            }
+            if (detectedReceipt.rowCount > 0) {
+                paymentStatus = await applyDetectedPayment(
+                    {
+                        id: result.rows[0].id,
+                        total: orderTotal || 0,
+                        payment_status: "pending",
+                        transaction_reference: normalizedTransactionReference
+                    },
+                    {
+                        reference: detectedReceipt.rows[0].transaction_reference,
+                        amount: Number(detectedReceipt.rows[0].amount),
+                        senderPhone: detectedReceipt.rows[0].sender_phone
+                    },
+                    referenceMatches
+                );
+            }
+        }
 
         return res.status(201).json({
             message: "Commande enregistrée",
@@ -419,7 +494,7 @@ router.post("/orders", async (req, res) => {
             reference: result.rows[0].reference,
             paymentMethod: result.rows[0].payment_method,
             transactionReference: result.rows[0].transaction_reference,
-            paymentStatus: result.rows[0].payment_status
+            paymentStatus
         });
 
     } catch (err) {
@@ -494,6 +569,62 @@ const listOrders = async (req, res) => {
 
 router.get("/orders", listOrders);
 router.get("/admin/orders", requireAdmin, listOrders);
+
+router.get("/admin/payment-alerts", requireAdmin, async (_req, res) => {
+    try {
+        const result = await db.query(
+            `
+            SELECT id, order_id, transaction_reference, expected_reference, amount,
+                   expected_amount, sender_phone, message, created_at
+            FROM payment_alerts
+            WHERE resolved_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT 50
+            `
+        );
+        return res.json(result.rows);
+    } catch (err) {
+        console.error("❌ Erreur alertes de paiement :", err);
+        return res.status(500).json({
+            message: "Impossible de charger les alertes de paiement."
+        });
+    }
+});
+
+router.post("/device/mvola-transactions", requireMvolaWebhook, async (req, res) => {
+    const reference = typeof req.body?.reference === "string"
+        ? req.body.reference.trim()
+        : "";
+    const amount = Number(req.body?.amount);
+    const senderPhone = typeof req.body?.sender_phone === "string"
+        ? req.body.sender_phone.trim().slice(0, 30)
+        : "";
+    const transactionType = String(req.body?.transaction_type || "").toLowerCase();
+    const transactionDate = new Date(req.body?.transaction_date);
+
+    if (transactionType !== "reception" || reference.length < 4 ||
+        reference.length > 100 || !Number.isFinite(amount) || amount <= 0 ||
+        !Number.isFinite(transactionDate.getTime())) {
+        return res.status(400).json({
+            message: "Le transfert reçu comporte des données invalides."
+        });
+    }
+
+    try {
+        const paymentStatus = await processDetectedPayment({
+            reference,
+            amount,
+            senderPhone,
+            transactionDate
+        });
+        return res.json({ payment_status: paymentStatus });
+    } catch (err) {
+        console.error("❌ Erreur de rapprochement MVola :", err);
+        return res.status(500).json({
+            message: "Impossible de rapprocher le transfert MVola avec une commande."
+        });
+    }
+});
 
 // =====================================================
 // VERIFY MANUAL MVOLA PAYMENT
