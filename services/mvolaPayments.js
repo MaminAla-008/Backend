@@ -1,16 +1,7 @@
 const db = require("../db");
 
-const normalizePhone = (value) => String(value || "").replace(/\D/g, "").slice(-9);
-
-const withinOneDay = (first, second) => {
-    const firstTime = new Date(first).getTime();
-    const secondTime = new Date(second).getTime();
-    return Number.isFinite(firstTime) && Number.isFinite(secondTime) &&
-        Math.abs(firstTime - secondTime) <= 24 * 60 * 60 * 1000;
-};
-
-const applyDetectedPayment = async (order, receipt, referenceMatches = true) => {
-    const matches = referenceMatches &&
+const applyDetectedPayment = async (order, receipt) => {
+    const matches =
         Math.round(Number(order.total) * 100) === Math.round(Number(receipt.amount) * 100);
     const paymentStatus = matches ? "verified" : "rejected";
 
@@ -45,13 +36,11 @@ const applyDetectedPayment = async (order, receipt, referenceMatches = true) => 
             [
                 order.id,
                 receipt.reference,
-                referenceMatches ? null : order.transaction_reference,
+                null,
                 receipt.amount,
                 Number(order.total),
                 receipt.senderPhone || null,
-                referenceMatches
-                    ? "Paiement détecté différent : le montant reçu ne correspond pas au montant de la commande."
-                    : "Paiement détecté différent : la référence reçue ne correspond pas à celle saisie."
+                "Paiement détecté différent : le montant reçu ne correspond pas au montant de la commande."
             ]
         );
     }
@@ -72,24 +61,7 @@ async function processDetectedPayment(receipt) {
         [receipt.reference]
     );
 
-    let order = orderResult.rows[0];
-    const referenceMatches = Boolean(order);
-    if (!order && receipt.senderPhone) {
-        const pendingOrders = await db.query(
-            `
-            SELECT id, client, total, payment_status, transaction_reference, created_at
-            FROM orders
-            WHERE payment_status = 'pending' AND payment_method = 'MVola'
-            `
-        );
-        const senderMatches = pendingOrders.rows.filter(
-            (candidate) => normalizePhone(candidate.client) === normalizePhone(receipt.senderPhone) &&
-                withinOneDay(candidate.created_at, receipt.transactionDate)
-        );
-        if (senderMatches.length === 1) {
-            order = senderMatches[0];
-        }
-    }
+    const order = orderResult.rows[0];
 
     if (!order) {
         await db.query(
@@ -109,11 +81,7 @@ async function processDetectedPayment(receipt) {
         return "unmatched";
     }
 
-    return applyDetectedPayment(
-        order,
-        receipt,
-        referenceMatches
-    );
+    return applyDetectedPayment(order, receipt);
 }
 
-module.exports = { processDetectedPayment };
+module.exports = { applyDetectedPayment, processDetectedPayment };
