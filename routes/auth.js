@@ -9,7 +9,8 @@ const googleOAuthClient = new OAuth2Client();
 const db = require("../db");
 const {
     applyDetectedPayment,
-    processDetectedPayment
+    processDetectedPayment,
+    settleVerifiedOrder
 } = require("../services/mvolaPayments");
 const isProduction =
     process.env.NODE_ENV === "production" ||
@@ -699,93 +700,266 @@ router.delete("/users/:id", requireAdmin, async (req, res) => {
 // CREATE ORDER
 // =====================================================
 
-router.post("/orders", requireUser, async (req, res) => {
-
-    const {
-        reference,
-        total,
-        items,
-        paymentMethod,
-        transactionReference
-    } = req.body;
-
-    if (!reference || items === undefined) {
-        return res.status(400).json({
-            message: "Données de commande incomplètes"
-        });
-    }
-
-    const normalizedTransactionReference =
-        typeof transactionReference === "string"
-            ? transactionReference.trim()
-            : "";
-    const normalizedPaymentMethod = paymentMethod || "MVola";
-    const orderTotal = Number(total);
-
-    if (
-        normalizedPaymentMethod === "MVola" &&
-        (normalizedTransactionReference.length < 4 ||
-            normalizedTransactionReference.length > 100 ||
-            !Number.isFinite(orderTotal) ||
-            orderTotal <= 0)
-    ) {
-        return res.status(400).json({
-            message: "Saisissez la référence exacte du transfert MVola et un montant de commande valide."
-        });
+router.post("/admin/catalog/sync", requireAdmin, async (req, res) => {
+    const catalog = req.body?.products;
+    if (!Array.isArray(catalog) || catalog.length === 0 || catalog.length > 500) {
+        return res.status(400).json({ message: "Catalogue invalide ou vide." });
     }
 
     try {
+        let synchronized = 0;
+        for (const product of catalog) {
+            const id = Number(product?.id);
+            const name = typeof product?.name === "string" ? product.name.trim() : "";
+            const rawPrice = String(product?.price ?? "").replace(/[^\d.-]/g, "");
+            const price = Number(rawPrice);
+            const rating = Number(product?.rating || 0);
+            if (!Number.isSafeInteger(id) || id < 1 || !name || name.length > 200 ||
+                !Number.isFinite(price) || price <= 0 ||
+                !Number.isInteger(rating) || rating < 0 || rating > 5) {
+                return res.status(400).json({ message: "Un article du catalogue est invalide." });
+            }
 
+            await db.query(
+                `INSERT INTO products
+                 (id, name, description, category, image, back_image, price, rating)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (id) DO UPDATE SET
+                    name = excluded.name,
+                    description = excluded.description,
+                    category = excluded.category,
+                    image = excluded.image,
+                    back_image = excluded.back_image,
+                    price = excluded.price,
+                    rating = excluded.rating,
+                    active = TRUE`,
+                [
+                    id,
+                    name,
+                    typeof product.description === "string" ? product.description.slice(0, 2000) : "",
+                    typeof product.category === "string" ? product.category.slice(0, 80) : "",
+                    typeof product.image === "string" ? product.image.slice(0, 2000) : "",
+                    typeof product.backImage === "string" ? product.backImage.slice(0, 2000) : "",
+                    price,
+                    rating
+                ]
+            );
+            synchronized += 1;
+        }
+        return res.json({ synchronized });
+    } catch (error) {
+        console.error("Erreur de synchronisation du catalogue :", error.message);
+        return res.status(500).json({ message: "Impossible de synchroniser le catalogue." });
+    }
+});
+
+router.get("/admin/inventory", requireAdmin, async (_req, res) => {
+    try {
         const result = await db.query(
-            `
-            INSERT INTO orders
-            (
-                client,
-                reference,
-                total,
-                items,
-                payment_method,
-                transaction_reference,
-                payment_status
-            )
-            VALUES
-            (
-                $1,
-                $2,
-                $3,
-                $4,
-                $5,
-                $6,
-                'pending'
-            )
-            RETURNING id, reference, payment_method, transaction_reference, payment_status
-            `,
+            `SELECT id, name, price, category, image, stock_on_hand, reserved,
+                    stock_on_hand - reserved AS available
+             FROM products
+             WHERE active = TRUE
+             ORDER BY name`
+        );
+        return res.json(result.rows);
+    } catch (error) {
+        console.error("Erreur de récupération du stock :", error.message);
+        return res.status(500).json({ message: "Impossible de récupérer le stock." });
+    }
+});
+
+router.patch("/admin/inventory/:id", requireAdmin, async (req, res) => {
+    const productId = Number(req.params.id);
+    const stockOnHand = req.body?.stock_on_hand;
+    if (!Number.isSafeInteger(productId) || productId < 1 ||
+        !Number.isSafeInteger(stockOnHand) || stockOnHand < 0 || stockOnHand > 1_000_000) {
+        return res.status(400).json({ message: "Produit ou quantité de stock invalide." });
+    }
+
+    try {
+        const result = await db.query(
+            `UPDATE products
+             SET stock_on_hand = $2
+             WHERE id = $1 AND reserved <= $2
+             RETURNING id, name, stock_on_hand, reserved,
+                       stock_on_hand - reserved AS available`,
+            [productId, stockOnHand]
+        );
+        if (result.rowCount === 0) {
+            const product = await db.query(
+                "SELECT id, reserved FROM products WHERE id = $1",
+                [productId]
+            );
+            if (product.rowCount === 0) {
+                return res.status(404).json({ message: "Produit introuvable." });
+            }
+            return res.status(409).json({
+                message: `Le stock ne peut pas être inférieur aux ${product.rows[0].reserved} article(s) déjà réservés.`
+            });
+        }
+        return res.json(result.rows[0]);
+    } catch (error) {
+        console.error("Erreur de mise à jour du stock :", error.message);
+        return res.status(500).json({ message: "Impossible de mettre à jour le stock." });
+    }
+});
+
+router.get("/products/availability", async (_req, res) => {
+    try {
+        const result = await db.query(
+            `SELECT id, stock_on_hand - reserved AS available
+             FROM products
+             WHERE active = TRUE`
+        );
+        return res.json(result.rows);
+    } catch (error) {
+        console.error("Erreur de récupération des disponibilités :", error.message);
+        return res.status(500).json({ message: "Impossible de récupérer les disponibilités." });
+    }
+});
+
+router.post("/orders", requireUser, async (req, res) => {
+    const reference = typeof req.body?.reference === "string"
+        ? req.body.reference.trim()
+        : "";
+    const items = req.body?.items;
+    const normalizedTransactionReference =
+        typeof req.body?.transactionReference === "string"
+            ? req.body.transactionReference.trim()
+            : "";
+    const normalizedPaymentMethod = req.body?.paymentMethod || "MVola";
+
+    if (!reference || reference.length > 100 || !Array.isArray(items) ||
+        items.length === 0 || items.length > 100) {
+        return res.status(400).json({ message: "Données de commande incomplètes ou invalides." });
+    }
+    if (normalizedPaymentMethod !== "MVola" ||
+        normalizedTransactionReference.length < 4 ||
+        normalizedTransactionReference.length > 100) {
+        return res.status(400).json({
+            message: "Saisissez la référence exacte du transfert MVola."
+        });
+    }
+
+    const requestedQuantities = new Map();
+    for (const item of items) {
+        const productId = Number(item?.id);
+        const quantity = item?.quantity === undefined ? 1 : Number(item.quantity);
+        if (!Number.isSafeInteger(productId) || productId < 1 ||
+            !Number.isSafeInteger(quantity) || quantity < 1 || quantity > 100) {
+            return res.status(400).json({ message: "Un article ou une quantité de commande est invalide." });
+        }
+        requestedQuantities.set(productId, (requestedQuantities.get(productId) || 0) + quantity);
+    }
+
+    let connection;
+    let transactionOpen = false;
+    try {
+        connection = await db.connect();
+        await connection.query("BEGIN");
+        transactionOpen = true;
+        const lockClause = db.isPostgres ? " FOR UPDATE" : "";
+        const orderItems = [];
+        let subtotal = 0;
+
+        const sortedQuantities = [...requestedQuantities].sort(
+            ([firstId], [secondId]) => firstId - secondId
+        );
+        for (const [productId, quantity] of sortedQuantities) {
+            const productResult = await connection.query(
+                `SELECT id, name, description, image, price, stock_on_hand, reserved
+                 FROM products
+                 WHERE id = $1 AND active = TRUE${lockClause}`,
+                [productId]
+            );
+            const product = productResult.rows[0];
+            if (!product) {
+                await connection.query("ROLLBACK");
+                transactionOpen = false;
+                return res.status(409).json({
+                    message: "Un article n’est plus disponible dans le catalogue."
+                });
+            }
+            if (Number(product.stock_on_hand) - Number(product.reserved) < quantity) {
+                await connection.query("ROLLBACK");
+                transactionOpen = false;
+                return res.status(409).json({
+                    message: `Stock insuffisant pour « ${product.name} ».`
+                });
+            }
+
+            const price = Number(product.price);
+            subtotal += price * quantity;
+            orderItems.push({
+                id: Number(product.id),
+                name: product.name,
+                description: product.description || "",
+                image: product.image || "",
+                price,
+                quantity
+            });
+        }
+
+        const shipping = 9.99;
+        const orderTotal = Number((subtotal + shipping).toFixed(2));
+        const orderResult = await connection.query(
+            `INSERT INTO orders
+             (client, reference, total, items, payment_method, transaction_reference,
+              payment_status, order_status, reservation_expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', 'awaiting_payment', $7)
+             RETURNING id, reference, payment_method, transaction_reference,
+                       payment_status, order_status, total`,
             [
                 req.user.username,
                 reference,
-                orderTotal || 0,
-                JSON.stringify(items),
+                orderTotal,
+                JSON.stringify(orderItems),
                 normalizedPaymentMethod,
-                normalizedTransactionReference || null
+                normalizedTransactionReference,
+                new Date(Date.now() + 15 * 60 * 1000).toISOString()
             ]
         );
+        const order = orderResult.rows[0];
+        await connection.query(
+            `INSERT INTO order_status_history (order_id, old_status, new_status, changed_by)
+             VALUES ($1, NULL, 'awaiting_payment', $2)`,
+            [order.id, req.user.username]
+        );
 
-        let paymentStatus = result.rows[0].payment_status;
-        if (normalizedTransactionReference) {
-            const detectedReceipt = await db.query(
-                `
-                SELECT transaction_reference, amount, sender_phone
-                FROM payment_alerts
-                WHERE transaction_reference = $1 AND resolved_at IS NULL
-                `,
-                [normalizedTransactionReference]
+        for (const item of orderItems) {
+            await connection.query(
+                `UPDATE products
+                 SET reserved = reserved + $2
+                 WHERE id = $1`,
+                [item.id, item.quantity]
             );
-            if (detectedReceipt.rowCount > 0) {
+            await connection.query(
+                `INSERT INTO order_inventory_reservations (order_id, product_id, quantity)
+                 VALUES ($1, $2, $3)`,
+                [order.id, item.id, item.quantity]
+            );
+        }
+        await connection.query("COMMIT");
+        transactionOpen = false;
+
+        let paymentStatus = order.payment_status;
+        let orderStatus = order.order_status;
+        let paymentReconciliationPending = false;
+        const detectedReceipt = await db.query(
+            `SELECT transaction_reference, amount, sender_phone
+             FROM payment_alerts
+             WHERE transaction_reference = $1 AND resolved_at IS NULL`,
+            [normalizedTransactionReference]
+        );
+        if (detectedReceipt.rowCount > 0) {
+            try {
                 paymentStatus = await applyDetectedPayment(
                     {
-                        id: result.rows[0].id,
-                        total: orderTotal || 0,
+                        id: order.id,
+                        total: orderTotal,
                         payment_status: "pending",
+                        order_status: "awaiting_payment",
                         transaction_reference: normalizedTransactionReference
                     },
                     {
@@ -794,20 +968,28 @@ router.post("/orders", requireUser, async (req, res) => {
                         senderPhone: detectedReceipt.rows[0].sender_phone
                     }
                 );
+                if (paymentStatus === "verified") orderStatus = "paid";
+            } catch (paymentError) {
+                paymentReconciliationPending = true;
+                console.error("La commande est enregistrée, mais le rapprochement MVola a échoué :", paymentError);
             }
         }
 
         return res.status(201).json({
-            message: "Commande enregistrée",
-            id: result.rows[0].id,
-            reference: result.rows[0].reference,
-            paymentMethod: result.rows[0].payment_method,
-            transactionReference: result.rows[0].transaction_reference,
-            paymentStatus
+            message: paymentReconciliationPending
+                ? "Commande enregistrée, mais le rapprochement du paiement doit être réessayé."
+                : "Commande enregistrée",
+            id: order.id,
+            reference: order.reference,
+            total: orderTotal,
+            paymentMethod: order.payment_method,
+            transactionReference: order.transaction_reference,
+            paymentStatus,
+            orderStatus,
+            paymentReconciliationPending
         });
-
     } catch (err) {
-
+        if (connection && transactionOpen) await connection.query("ROLLBACK");
         if (
             err.code === "23505" ||
             err.code === "SQLITE_CONSTRAINT" ||
@@ -818,14 +1000,10 @@ router.post("/orders", requireUser, async (req, res) => {
             });
         }
 
-        console.error(
-            "❌ Erreur commande :",
-            err
-        );
-
-        res.status(500).json({
-            message: "Erreur serveur"
-        });
+        console.error("❌ Erreur commande :", err);
+        return res.status(500).json({ message: "Erreur serveur" });
+    } finally {
+        connection?.release();
     }
 });
 
@@ -848,6 +1026,7 @@ const listOrders = async (req, res) => {
                 payment_method,
                 transaction_reference,
                 payment_status,
+                order_status,
                 created_at
             FROM orders
             ${isCustomer ? "WHERE client = $1" : ""}
@@ -882,12 +1061,99 @@ const listOrders = async (req, res) => {
 router.get("/orders", requireUser, listOrders);
 router.get("/admin/orders", requireAdmin, listOrders);
 
+router.patch("/admin/orders/:id/status", requireAdmin, async (req, res) => {
+    const orderId = Number(req.params.id);
+    const nextStatus = typeof req.body?.status === "string" ? req.body.status : "";
+    const allowedTransitions = {
+        awaiting_payment: ["cancelled"],
+        paid: ["preparing"],
+        preparing: ["shipped"],
+        shipped: ["delivered"],
+        delivered: ["refunded"],
+        cancelled: [],
+        refunded: []
+    };
+    if (!Number.isSafeInteger(orderId) || orderId < 1 ||
+        !Object.prototype.hasOwnProperty.call(allowedTransitions, nextStatus)) {
+        return res.status(400).json({ message: "Commande ou statut invalide." });
+    }
+
+    let connection;
+    try {
+        connection = await db.connect();
+        await connection.query("BEGIN");
+        const lockClause = db.isPostgres ? " FOR UPDATE" : "";
+        const orderResult = await connection.query(
+            `SELECT id, order_status FROM orders WHERE id = $1${lockClause}`,
+            [orderId]
+        );
+        const order = orderResult.rows[0];
+        if (!order) {
+            await connection.query("ROLLBACK");
+            return res.status(404).json({ message: "Cette commande n’existe plus." });
+        }
+        if (!allowedTransitions[order.order_status]?.includes(nextStatus)) {
+            await connection.query("ROLLBACK");
+            return res.status(409).json({
+                message: `Transition impossible : ${order.order_status} → ${nextStatus}.`
+            });
+        }
+
+        if (nextStatus === "cancelled") {
+            const reservations = await connection.query(
+                `SELECT product_id, quantity
+                 FROM order_inventory_reservations
+                 WHERE order_id = $1
+                 ORDER BY product_id${lockClause}`,
+                [orderId]
+            );
+            for (const reservation of reservations.rows) {
+                const released = await connection.query(
+                    `UPDATE products
+                     SET reserved = reserved - $2
+                     WHERE id = $1 AND reserved >= $2`,
+                    [reservation.product_id, reservation.quantity]
+                );
+                if (released.rowCount !== 1) {
+                    throw new Error(`Impossible de libérer la réservation du produit ${reservation.product_id}.`);
+                }
+            }
+            await connection.query(
+                "DELETE FROM order_inventory_reservations WHERE order_id = $1",
+                [orderId]
+            );
+        }
+
+        await connection.query(
+            "UPDATE orders SET order_status = $2, reservation_expires_at = NULL WHERE id = $1",
+            [orderId, nextStatus]
+        );
+        await connection.query(
+            `INSERT INTO order_status_history (order_id, old_status, new_status, changed_by)
+             VALUES ($1, $2, $3, 'admin')`,
+            [orderId, order.order_status, nextStatus]
+        );
+        await connection.query("COMMIT");
+        return res.json({
+            id: orderId,
+            previous_status: order.order_status,
+            order_status: nextStatus
+        });
+    } catch (error) {
+        if (connection) await connection.query("ROLLBACK");
+        console.error("Erreur de mise à jour du statut de commande :", error.message);
+        return res.status(500).json({ message: "Impossible de mettre à jour le statut." });
+    } finally {
+        connection?.release();
+    }
+});
+
 router.get("/admin/payment-alerts", requireAdmin, async (_req, res) => {
     try {
         const result = await db.query(
             `
             SELECT id, order_id, transaction_reference, expected_reference, amount,
-                   expected_amount, sender_phone, message, created_at
+                   expected_amount, sender_phone, message, alert_type, created_at
             FROM payment_alerts
             WHERE resolved_at IS NULL
             ORDER BY created_at DESC
@@ -900,6 +1166,159 @@ router.get("/admin/payment-alerts", requireAdmin, async (_req, res) => {
         return res.status(500).json({
             message: "Impossible de charger les alertes de paiement."
         });
+    }
+});
+
+router.patch("/admin/payment-alerts/:id/resolve", requireAdmin, async (req, res) => {
+    const alertId = Number(req.params.id);
+    const action = req.body?.action;
+    if (!Number.isSafeInteger(alertId) || alertId < 1 ||
+        !["fulfill", "refunded"].includes(action)) {
+        return res.status(400).json({ message: "Alerte ou décision invalide." });
+    }
+
+    let connection;
+    let transactionOpen = false;
+    try {
+        connection = await db.connect();
+        await connection.query("BEGIN");
+        transactionOpen = true;
+        const lockClause = db.isPostgres ? " FOR UPDATE" : "";
+        const alertResult = await connection.query(
+            `SELECT id, order_id, transaction_reference, amount, expected_amount, alert_type, resolved_at
+             FROM payment_alerts
+             WHERE id = $1${lockClause}`,
+            [alertId]
+        );
+        const alert = alertResult.rows[0];
+        if (!alert || alert.alert_type !== "late_payment" || alert.resolved_at || !alert.order_id) {
+            await connection.query("ROLLBACK");
+            transactionOpen = false;
+            return res.status(alert ? 409 : 404).json({
+                message: alert
+                    ? "Cette alerte n’est pas un paiement tardif à traiter ou elle est déjà résolue."
+                    : "Cette alerte n’existe plus."
+            });
+        }
+
+        const orderResult = await connection.query(
+            `SELECT id, total, items, transaction_reference, payment_status, order_status
+             FROM orders
+             WHERE id = $1${lockClause}`,
+            [alert.order_id]
+        );
+        const order = orderResult.rows[0];
+        if (!order || order.order_status !== "cancelled" ||
+            order.payment_status !== "pending" ||
+            order.transaction_reference !== alert.transaction_reference ||
+            Math.round(Number(order.total) * 100) !== Math.round(Number(alert.amount) * 100) ||
+            Math.round(Number(order.total) * 100) !== Math.round(Number(alert.expected_amount) * 100)) {
+            await connection.query("ROLLBACK");
+            transactionOpen = false;
+            return res.status(409).json({
+                message: "La commande ou le montant ne correspond plus à cette alerte."
+            });
+        }
+
+        const nextStatus = action === "fulfill" ? "paid" : "refunded";
+        const nextPaymentStatus = action === "fulfill" ? "verified" : "refunded";
+        const inventoryUpdates = [];
+
+        if (action === "fulfill") {
+            let items;
+            try {
+                items = JSON.parse(order.items);
+            } catch {
+                throw new Error(`Articles invalides dans la commande ${order.id}.`);
+            }
+            if (!Array.isArray(items) || items.length === 0) {
+                throw new Error(`Aucun article valide dans la commande ${order.id}.`);
+            }
+
+            const quantities = new Map();
+            for (const item of items) {
+                const productId = Number(item?.id);
+                const quantity = item?.quantity === undefined ? 1 : Number(item.quantity);
+                if (!Number.isSafeInteger(productId) || productId < 1 ||
+                    !Number.isSafeInteger(quantity) || quantity < 1) {
+                    throw new Error(`Article invalide dans la commande ${order.id}.`);
+                }
+                quantities.set(productId, (quantities.get(productId) || 0) + quantity);
+            }
+
+            const sortedQuantities = [...quantities].sort(
+                ([firstId], [secondId]) => firstId - secondId
+            );
+            for (const [productId, quantity] of sortedQuantities) {
+                const productResult = await connection.query(
+                    `SELECT id, name, stock_on_hand, reserved
+                     FROM products
+                     WHERE id = $1${lockClause}`,
+                    [productId]
+                );
+                const product = productResult.rows[0];
+                if (!product || Number(product.stock_on_hand) - Number(product.reserved) < quantity) {
+                    await connection.query("ROLLBACK");
+                    transactionOpen = false;
+                    return res.status(409).json({
+                        message: `Stock insuffisant pour honorer cette commande. Un remboursement manuel est requis.`
+                    });
+                }
+
+                const updated = await connection.query(
+                    `UPDATE products
+                     SET stock_on_hand = stock_on_hand - $2
+                     WHERE id = $1 AND stock_on_hand - reserved >= $2`,
+                    [productId, quantity]
+                );
+                if (updated.rowCount !== 1) {
+                    throw new Error(`Impossible de décrémenter le stock du produit ${productId}.`);
+                }
+                inventoryUpdates.push({
+                    id: Number(product.id),
+                    stock_on_hand: Number(product.stock_on_hand) - quantity,
+                    reserved: Number(product.reserved),
+                    available: Number(product.stock_on_hand) - Number(product.reserved) - quantity
+                });
+            }
+        }
+
+        await connection.query(
+            `UPDATE orders
+             SET payment_status = $2, order_status = $3, reservation_expires_at = NULL
+             WHERE id = $1`,
+            [order.id, nextPaymentStatus, nextStatus]
+        );
+        await connection.query(
+            "UPDATE payment_alerts SET resolved_at = CURRENT_TIMESTAMP WHERE id = $1",
+            [alertId]
+        );
+        await connection.query(
+            `INSERT INTO order_status_history (order_id, old_status, new_status, changed_by)
+             VALUES ($1, 'cancelled', $2, 'admin')`,
+            [order.id, nextStatus]
+        );
+        await connection.query("COMMIT");
+        transactionOpen = false;
+        return res.json({
+            message: action === "fulfill"
+                ? "Paiement tardif accepté, commande réactivée et stock décrémenté."
+                : "Remboursement confirmé et alerte clôturée.",
+            order: {
+                id: order.id,
+                payment_status: nextPaymentStatus,
+                order_status: nextStatus
+            },
+            inventory: inventoryUpdates
+        });
+    } catch (error) {
+        if (connection && transactionOpen) await connection.query("ROLLBACK");
+        console.error("Erreur de résolution d’un paiement tardif :", error);
+        return res.status(500).json({
+            message: "Impossible de traiter ce paiement tardif."
+        });
+    } finally {
+        connection?.release();
     }
 });
 
@@ -954,7 +1373,7 @@ router.patch("/admin/orders/:id/payment", requireAdmin, async (req, res) => {
     try {
         const existingOrder = await db.query(
             `
-            SELECT id, reference, transaction_reference
+            SELECT id, reference, transaction_reference, payment_status, order_status
             FROM orders
             WHERE id = $1
                 AND transaction_reference IS NOT NULL
@@ -975,13 +1394,24 @@ router.patch("/admin/orders/:id/payment", requireAdmin, async (req, res) => {
             });
         }
 
-        await db.query(
-            "UPDATE orders SET payment_status = 'verified' WHERE id = $1",
-            [orderId]
-        );
+        const orderBeforeVerification = existingOrder.rows[0];
+        if (orderBeforeVerification.payment_status === "verified") {
+            return res.json({
+                message: "Ce paiement est déjà vérifié.",
+                order: orderBeforeVerification
+            });
+        }
+        if (orderBeforeVerification.order_status !== "awaiting_payment" ||
+            orderBeforeVerification.payment_status !== "pending") {
+            return res.status(409).json({
+                message: "Cette commande ne peut plus être vérifiée comme un paiement en attente."
+            });
+        }
+
+        await settleVerifiedOrder(orderId);
         const result = await db.query(
             `
-            SELECT id, reference, transaction_reference, payment_status
+            SELECT id, reference, transaction_reference, payment_status, order_status
             FROM orders
             WHERE id = $1
             `,
@@ -1013,26 +1443,59 @@ router.delete("/admin/orders/:id", requireAdmin, async (req, res) => {
         });
     }
 
+    let connection;
     try {
-        const result = await db.query(
+        connection = await db.connect();
+        await connection.query("BEGIN");
+        const lockClause = db.isPostgres ? " FOR UPDATE" : "";
+        const existingOrder = await connection.query(
+            `SELECT id FROM orders WHERE id = $1${lockClause}`,
+            [orderId]
+        );
+        if (existingOrder.rowCount === 0) {
+            await connection.query("ROLLBACK");
+            return res.status(404).json({ message: "Cette commande n’existe plus." });
+        }
+        const reservations = await connection.query(
+            `SELECT product_id, quantity
+             FROM order_inventory_reservations
+             WHERE order_id = $1
+             ORDER BY product_id${lockClause}`,
+            [orderId]
+        );
+        for (const reservation of reservations.rows) {
+            const released = await connection.query(
+                `UPDATE products
+                 SET reserved = reserved - $2
+                 WHERE id = $1 AND reserved >= $2`,
+                [reservation.product_id, reservation.quantity]
+            );
+            if (released.rowCount !== 1) {
+                throw new Error(`Impossible de libérer la réservation du produit ${reservation.product_id}.`);
+            }
+        }
+        await connection.query(
+            "DELETE FROM order_inventory_reservations WHERE order_id = $1",
+            [orderId]
+        );
+        await connection.query(
+            "DELETE FROM order_status_history WHERE order_id = $1",
+            [orderId]
+        );
+        const result = await connection.query(
             "DELETE FROM orders WHERE id = $1 RETURNING id",
             [orderId]
         );
-
-        if (result.rowCount === 0) {
-            return res.status(404).json({
-                message: "Cette commande n’existe plus."
-            });
-        }
-
-        return res.json({
-            message: "Commande supprimée."
-        });
+        await connection.query("COMMIT");
+        return res.json({ message: "Commande supprimée." });
     } catch (err) {
+        if (connection) await connection.query("ROLLBACK");
         console.error("❌ Erreur suppression commande :", err);
         return res.status(500).json({
             message: "Erreur serveur lors de la suppression de la commande."
         });
+    } finally {
+        connection?.release();
     }
 });
 

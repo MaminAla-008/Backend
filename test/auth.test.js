@@ -21,6 +21,10 @@ const databasePath = process.env.SHOPIX_SQLITE_PATH;
 const fetchApi = global.fetch.bind(global);
 const express = require("express");
 const db = require("../db");
+const {
+    processDetectedPayment,
+    releaseExpiredOrderReservations
+} = require("../services/mvolaPayments");
 const app = express();
 app.use(express.json());
 app.use("/api/auth", require("../routes/auth"));
@@ -47,6 +51,16 @@ after(async () => {
 const post = (route, payload, token) =>
     fetchApi(`${apiBase}${route}`, {
         method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {})
+        },
+        body: JSON.stringify(payload)
+    });
+
+const patch = (route, payload, token) =>
+    fetchApi(`${apiBase}${route}`, {
+        method: "PATCH",
         headers: {
             "Content-Type": "application/json",
             ...(token ? { Authorization: `Bearer ${token}` } : {})
@@ -119,24 +133,114 @@ test("Google login configuration and customer SMS password reset", async () => {
         });
         assert.equal(login.status, 200);
         const loggedInUser = await login.json();
+        await db.query(
+            `INSERT INTO products
+                (id, name, price, stock_on_hand, reserved, active)
+             VALUES ($1, $2, $3, $4, 0, 1)`,
+            [901, "Test item", 25, 2]
+        );
 
+        const orderReference = `TEST-${Date.now()}`;
+        const orderTransactionReference = `TEST-TXN-${Date.now()}`;
         const orderResponse = await post(
             "/orders",
             {
-                reference: `TEST-${Date.now()}`,
-                total: 25,
+                reference: orderReference,
                 paymentMethod: "MVola",
-                transactionReference: `TEST-TXN-${Date.now()}`,
-                items: [{ name: "Test item", price: 25 }]
+                transactionReference: orderTransactionReference,
+                items: [{ id: 901, quantity: 1 }]
             },
             loggedInUser.token
         );
         assert.equal(orderResponse.status, 201);
+        const createdOrder = await orderResponse.json();
+        assert.equal(createdOrder.total, 34.99);
+        assert.equal(createdOrder.orderStatus, "awaiting_payment");
+        const stockAfterReservation = await db.query(
+            "SELECT stock_on_hand, reserved FROM products WHERE id = $1",
+            [901]
+        );
+        assert.deepEqual(stockAfterReservation.rows[0], { stock_on_hand: 2, reserved: 1 });
+
+        const unavailableOrder = await post(
+            "/orders",
+            {
+                reference: `TEST-OUT-${Date.now()}`,
+                paymentMethod: "MVola",
+                transactionReference: `TEST-TXN-OUT-${Date.now()}`,
+                items: [{ id: 901, quantity: 2 }]
+            },
+            loggedInUser.token
+        );
+        assert.equal(unavailableOrder.status, 409);
+
+        await db.query(
+            "UPDATE orders SET reservation_expires_at = $1 WHERE reference = $2",
+            ["2000-01-01 00:00:00", orderReference]
+        );
+        assert.equal(await releaseExpiredOrderReservations(), 1);
+        const stockAfterExpiry = await db.query(
+            "SELECT stock_on_hand, reserved FROM products WHERE id = $1",
+            [901]
+        );
+        assert.deepEqual(stockAfterExpiry.rows[0], { stock_on_hand: 2, reserved: 0 });
+        const expiredOrders = await fetchApi(`${apiBase}/orders`, {
+            headers: { Authorization: `Bearer ${loggedInUser.token}` }
+        });
+        assert.equal((await expiredOrders.json())[0].order_status, "cancelled");
+
+        const adminLogin = await post("/admin/login", {
+            username: "admin",
+            password: "admin123"
+        });
+        assert.equal(adminLogin.status, 200);
+        const adminToken = (await adminLogin.json()).token;
+        const paidOrderResponse = await post(
+            "/orders",
+            {
+                reference: `TEST-PAID-${Date.now()}`,
+                paymentMethod: "MVola",
+                transactionReference: `TEST-TXN-PAID-${Date.now()}`,
+                items: [{ id: 901, quantity: 1 }]
+            },
+            loggedInUser.token
+        );
+        assert.equal(paidOrderResponse.status, 201);
+        const paidOrder = await paidOrderResponse.json();
+        const stockBeforePayment = await db.query(
+            "SELECT stock_on_hand, reserved FROM products WHERE id = $1",
+            [901]
+        );
+        assert.deepEqual(stockBeforePayment.rows[0], { stock_on_hand: 2, reserved: 1 });
+        const verifyPayment = await patch(
+            `/admin/orders/${paidOrder.id}/payment`,
+            { status: "verified" },
+            adminToken
+        );
+        assert.equal(verifyPayment.status, 200);
+        const verifiedOrder = await verifyPayment.json();
+        assert.equal(verifiedOrder.order.order_status, "paid");
+        const stockAfterFirstVerification = await db.query(
+            "SELECT stock_on_hand, reserved FROM products WHERE id = $1",
+            [901]
+        );
+        assert.deepEqual(stockAfterFirstVerification.rows[0], { stock_on_hand: 1, reserved: 0 });
+        const verifyPaymentAgain = await patch(
+            `/admin/orders/${paidOrder.id}/payment`,
+            { status: "verified" },
+            adminToken
+        );
+        assert.equal(verifyPaymentAgain.status, 200);
+        const stockAfterPayment = await db.query(
+            "SELECT stock_on_hand, reserved FROM products WHERE id = $1",
+            [901]
+        );
+        assert.deepEqual(stockAfterPayment.rows[0], { stock_on_hand: 1, reserved: 0 });
 
         const ownOrders = await fetchApi(`${apiBase}/orders`, {
             headers: { Authorization: `Bearer ${loggedInUser.token}` }
         });
-        assert.equal((await ownOrders.json()).length, 1);
+        assert.equal((await ownOrders.json()).length, 2);
 
         const secondRegistration = await post("/register", {
             phone: `035${String(Date.now()).slice(-7)}`,
@@ -148,6 +252,133 @@ test("Google login configuration and customer SMS password reset", async () => {
             headers: { Authorization: `Bearer ${secondUser.token}` }
         });
         assert.deepEqual(await otherOrders.json(), []);
+
+        const cancelableOrderResponse = await post(
+            "/orders",
+            {
+                reference: `TEST-CANCEL-${Date.now()}`,
+                paymentMethod: "MVola",
+                transactionReference: `TEST-TXN-CANCEL-${Date.now()}`,
+                items: [{ id: 901, quantity: 1 }]
+            },
+            loggedInUser.token
+        );
+        assert.equal(cancelableOrderResponse.status, 201);
+        const cancelableOrder = await cancelableOrderResponse.json();
+        const cancelOrder = await patch(
+            `/admin/orders/${cancelableOrder.id}/status`,
+            { status: "cancelled" },
+            adminToken
+        );
+        assert.equal(cancelOrder.status, 200);
+        assert.equal((await cancelOrder.json()).order_status, "cancelled");
+        const stockAfterCancellation = await db.query(
+            "SELECT stock_on_hand, reserved FROM products WHERE id = $1",
+            [901]
+        );
+        assert.deepEqual(stockAfterCancellation.rows[0], { stock_on_hand: 1, reserved: 0 });
+        const cancelPaidOrder = await patch(
+            `/admin/orders/${paidOrder.id}/status`,
+            { status: "cancelled" },
+            adminToken
+        );
+        assert.equal(cancelPaidOrder.status, 409);
+
+        assert.equal(
+            await processDetectedPayment({
+                reference: orderTransactionReference,
+                amount: createdOrder.total,
+                senderPhone: "0341234567"
+            }),
+            "review"
+        );
+        const lateAlertsResponse = await fetchApi(`${apiBase}/admin/payment-alerts`, {
+            headers: { Authorization: `Bearer ${adminToken}` }
+        });
+        const lateAlerts = await lateAlertsResponse.json();
+        const lateAlert = lateAlerts.find((alert) => alert.alert_type === "late_payment");
+        assert.ok(lateAlert);
+        const acceptedLatePayment = await patch(
+            `/admin/payment-alerts/${lateAlert.id}/resolve`,
+            { action: "fulfill" },
+            adminToken
+        );
+        assert.equal(acceptedLatePayment.status, 200);
+        assert.equal((await acceptedLatePayment.json()).order.order_status, "paid");
+        const stockAfterLatePayment = await db.query(
+            "SELECT stock_on_hand, reserved FROM products WHERE id = $1",
+            [901]
+        );
+        assert.deepEqual(stockAfterLatePayment.rows[0], { stock_on_hand: 0, reserved: 0 });
+
+        await db.query("UPDATE products SET stock_on_hand = 2 WHERE id = $1", [901]);
+        const refundTransactionReference = `TEST-TXN-REFUND-${Date.now()}`;
+        const refundOrderResponse = await post(
+            "/orders",
+            {
+                reference: `TEST-REFUND-${Date.now()}`,
+                paymentMethod: "MVola",
+                transactionReference: refundTransactionReference,
+                items: [{ id: 901, quantity: 1 }]
+            },
+            loggedInUser.token
+        );
+        assert.equal(refundOrderResponse.status, 201);
+        const refundOrder = await refundOrderResponse.json();
+        const cancelRefundOrder = await patch(
+            `/admin/orders/${refundOrder.id}/status`,
+            { status: "cancelled" },
+            adminToken
+        );
+        assert.equal(cancelRefundOrder.status, 200);
+        assert.equal(
+            await processDetectedPayment({
+                reference: refundTransactionReference,
+                amount: refundOrder.total,
+                senderPhone: "0341234567"
+            }),
+            "review"
+        );
+
+        const blockingOrderResponse = await post(
+            "/orders",
+            {
+                reference: `TEST-BLOCK-${Date.now()}`,
+                paymentMethod: "MVola",
+                transactionReference: `TEST-TXN-BLOCK-${Date.now()}`,
+                items: [{ id: 901, quantity: 2 }]
+            },
+            loggedInUser.token
+        );
+        assert.equal(blockingOrderResponse.status, 201);
+        const blockingOrder = await blockingOrderResponse.json();
+        const refundAlertsResponse = await fetchApi(`${apiBase}/admin/payment-alerts`, {
+            headers: { Authorization: `Bearer ${adminToken}` }
+        });
+        const refundAlerts = await refundAlertsResponse.json();
+        const refundAlert = refundAlerts.find(
+            (alert) => alert.transaction_reference === refundTransactionReference
+        );
+        assert.ok(refundAlert);
+        const insufficientStock = await patch(
+            `/admin/payment-alerts/${refundAlert.id}/resolve`,
+            { action: "fulfill" },
+            adminToken
+        );
+        assert.equal(insufficientStock.status, 409);
+        const refundConfirmed = await patch(
+            `/admin/payment-alerts/${refundAlert.id}/resolve`,
+            { action: "refunded" },
+            adminToken
+        );
+        assert.equal(refundConfirmed.status, 200);
+        assert.equal((await refundConfirmed.json()).order.payment_status, "refunded");
+        const cancelBlockingOrder = await patch(
+            `/admin/orders/${blockingOrder.id}/status`,
+            { status: "cancelled" },
+            adminToken
+        );
+        assert.equal(cancelBlockingOrder.status, 200);
 
         const callsBeforeUnknownPhone = twilioRequests.length;
         const unknownPhoneRequest = await post("/password-reset/request", {

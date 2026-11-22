@@ -1,7 +1,8 @@
 const express = require("express");
-const { createHash, randomBytes, randomInt } = require("node:crypto");
+const { createHash, randomBytes, randomInt, timingSafeEqual } = require("node:crypto");
 const db = require("../db");
 const { processDetectedPayment } = require("../services/mvolaPayments");
+const { createRateLimit } = require("../middleware/rateLimit");
 
 const router = express.Router();
 const PHONE_PATTERN = /^\+[1-9]\d{7,14}$/;
@@ -65,7 +66,11 @@ router.get("/test-db", async (_req, res) => {
     }
 });
 
-router.post("/devices/pairing-codes", async (req, res) => {
+router.post("/devices/pairing-codes", createRateLimit({
+    limit: 3,
+    windowMs: 15 * 60 * 1000,
+    key: (req) => req.body?.phone_number
+}), async (req, res) => {
     const phoneNumber = String(req.body?.phone_number || "").trim();
     if (!PHONE_PATTERN.test(phoneNumber)) {
         return res.status(400).json({
@@ -89,7 +94,11 @@ router.post("/devices/pairing-codes", async (req, res) => {
     }
 });
 
-router.post("/devices/claim", async (req, res) => {
+router.post("/devices/claim", createRateLimit({
+    limit: 10,
+    windowMs: 15 * 60 * 1000,
+    key: (req) => req.body?.phone_number
+}), async (req, res) => {
     const phoneNumber = String(req.body?.phone_number || "").trim();
     const pairingCode = String(req.body?.pairing_code || "").trim();
     if (!PHONE_PATTERN.test(phoneNumber) || !/^\d{6}$/.test(pairingCode)) {
@@ -184,6 +193,124 @@ router.delete("/devices/current", authenticateDevice, async (req, res) => {
     } catch (error) {
         console.error("Erreur de déconnexion du téléphone :", error.message);
         return res.status(500).json({ message: "Impossible de déconnecter le téléphone." });
+    }
+});
+
+router.post("/devices/history-clear-codes", authenticateDevice, createRateLimit({
+    limit: 3,
+    windowMs: 60 * 60 * 1000,
+    key: (req) => req.devicePhone
+}), async (req, res) => {
+    const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+    try {
+        await db.query(
+            `INSERT INTO dashboard_history_clear_codes
+             (phone_number, code_hash, expires_at, failed_attempts)
+             VALUES ($1, $2, $3, 0)
+             ON CONFLICT (phone_number) DO UPDATE SET
+                 code_hash = EXCLUDED.code_hash,
+                 expires_at = EXCLUDED.expires_at,
+                 failed_attempts = 0,
+                 created_at = CURRENT_TIMESTAMP`,
+            [
+                req.devicePhone,
+                hashSecret(code),
+                databaseDate(new Date(Date.now() + 10 * 60 * 1000))
+            ]
+        );
+        return res.status(201).json({ code, expires_in_seconds: 600 });
+    } catch (error) {
+        console.error("Erreur de création du code d’effacement :", error.message);
+        return res.status(500).json({
+            message: "Impossible de créer le code d’effacement."
+        });
+    }
+});
+
+router.delete("/history", createRateLimit({
+    limit: 5,
+    windowMs: 60 * 60 * 1000,
+    key: (req) => req.body?.phone_number
+}), async (req, res) => {
+    const phoneNumber = String(req.body?.phone_number || "").trim();
+    const code = String(req.body?.code || "").trim();
+    const historyType = String(req.body?.history_type || "");
+    if (!PHONE_PATTERN.test(phoneNumber) ||
+        !/^\d{6}$/.test(code) ||
+        !["transactions", "notifications"].includes(historyType)) {
+        return res.status(400).json({
+            message: "Type d’historique, numéro ou code d’effacement invalide."
+        });
+    }
+
+    let connection;
+    try {
+        connection = await db.connect();
+        await connection.query("BEGIN");
+        const lockClause = db.isPostgres ? " FOR UPDATE" : "";
+        const codeResult = await connection.query(
+            `SELECT code_hash, failed_attempts
+             FROM dashboard_history_clear_codes
+             WHERE phone_number = $1 AND expires_at > CURRENT_TIMESTAMP
+             ${lockClause}`,
+            [phoneNumber]
+        );
+        if (codeResult.rows.length === 0) {
+            await connection.query("ROLLBACK");
+            return res.status(401).json({
+                message: "Code d’effacement invalide ou expiré."
+            });
+        }
+
+        const expectedHash = Buffer.from(codeResult.rows[0].code_hash.trim(), "hex");
+        const receivedHash = Buffer.from(hashSecret(code), "hex");
+        if (!timingSafeEqual(expectedHash, receivedHash)) {
+            const failedAttempts = Number(codeResult.rows[0].failed_attempts) + 1;
+            if (failedAttempts >= 5) {
+                await connection.query(
+                    "DELETE FROM dashboard_history_clear_codes WHERE phone_number = $1",
+                    [phoneNumber]
+                );
+            } else {
+                await connection.query(
+                    `UPDATE dashboard_history_clear_codes
+                     SET failed_attempts = $2
+                     WHERE phone_number = $1`,
+                    [phoneNumber, failedAttempts]
+                );
+            }
+            await connection.query("COMMIT");
+            return res.status(401).json({
+                message: "Code d’effacement invalide ou expiré."
+            });
+        }
+
+        await connection.query(
+            "DELETE FROM dashboard_history_clear_codes WHERE phone_number = $1",
+            [phoneNumber]
+        );
+        const deleted = historyType === "transactions"
+            ? await connection.query(
+                "DELETE FROM transactions WHERE owner_phone = $1",
+                [phoneNumber]
+            )
+            : await connection.query(
+                "DELETE FROM device_notifications WHERE owner_phone = $1",
+                [phoneNumber]
+            );
+        await connection.query("COMMIT");
+        return res.json({
+            history_type: historyType,
+            deleted_count: deleted.rowCount
+        });
+    } catch (error) {
+        if (connection) await connection.query("ROLLBACK");
+        console.error("Erreur d’effacement de l’historique :", error.message);
+        return res.status(500).json({
+            message: "Impossible d’effacer l’historique du compte."
+        });
+    } finally {
+        connection?.release();
     }
 });
 
