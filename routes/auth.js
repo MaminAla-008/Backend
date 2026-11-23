@@ -722,8 +722,8 @@ router.post("/admin/catalog/sync", requireAdmin, async (req, res) => {
 
             await db.query(
                 `INSERT INTO products
-                 (id, name, description, category, image, back_image, price, rating)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 (id, name, description, category, image, back_image, price, rating, stock_on_hand)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 100)
                  ON CONFLICT (id) DO UPDATE SET
                     name = excluded.name,
                     description = excluded.description,
@@ -1267,8 +1267,13 @@ router.patch("/admin/payment-alerts/:id/resolve", requireAdmin, async (req, res)
 
                 const updated = await connection.query(
                     `UPDATE products
-                     SET stock_on_hand = stock_on_hand - $2
-                     WHERE id = $1 AND stock_on_hand - reserved >= $2`,
+                     SET stock_on_hand = stock_on_hand - $2,
+                         reserved = CASE
+                             WHEN reserved >= $2 THEN reserved - $2
+                             ELSE reserved
+                         END
+                     WHERE id = $1
+                       AND stock_on_hand - reserved >= $2`,
                     [productId, quantity]
                 );
                 if (updated.rowCount !== 1) {
